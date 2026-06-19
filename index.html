@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AnilEmre01 - Merkeziyetsiz Chat</title>
+    <!-- GunDB (Merkeziyetsiz Veritabanı) ve Tailwind CSS -->
+    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col justify-between font-sans">
+
+    <!-- Giriş Ekranı -->
+    <div id="login-screen" class="flex-1 flex items-center justify-center p-4">
+        <div class="bg-gray-800 p-8 rounded-lg shadow-xl w-full max-w-md border border-gray-700">
+            <h1 class="text-2xl font-bold text-center mb-6 text-indigo-400">🔒 E2EE Merkeziyetsiz Chat</h1>
+            
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1">Oda Adı (Gizli kalacak):</label>
+                    <input type="text" id="room-input" class="w-full bg-gray-700 border border-gray-600 rounded p-2 focus:outline-none focus:border-indigo-500" placeholder="Örn: gizli-sohbet">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1">Şifreleme Anahtarı (Ortak Şifre):</label>
+                    <input type="password" id="password-input" class="w-full bg-gray-700 border border-gray-600 rounded p-2 focus:outline-none focus:border-indigo-500" placeholder="Mesaj şifresini çözmek için ortak şifre">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1">Takma Adınız (Rumuz):</label>
+                    <input type="text" id="username-input" class="w-full bg-gray-700 border border-gray-600 rounded p-2 focus:outline-none focus:border-indigo-500" placeholder="Örn: Anıl">
+                </div>
+                <button onclick="joinRoom()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded transition">
+                    Odaya Bağlan
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sohbet Ekranı -->
+    <div id="chat-screen" class="hidden flex-1 flex flex-col h-screen max-w-4xl mx-auto w-full p-4">
+        <!-- Üst Bar -->
+        <div class="bg-gray-800 p-4 rounded-t-lg border-b border-gray-700 flex justify-between items-center">
+            <div>
+                <h2 id="active-room-title" class="text-lg font-bold text-indigo-400">Oda</h2>
+                <span class="text-xs text-green-400">● P2P Merkeziyetsiz Bağlantı Aktif</span>
+            </div>
+            <button onclick="leaveRoom()" class="text-xs bg-red-600 hover:bg-red-700 px-3 py-1 rounded">Çıkış Yap</button>
+        </div>
+
+        <!-- Mesaj Listesi -->
+        <div id="messages-container" class="flex-1 bg-gray-950 p-4 overflow-y-auto space-y-4 border-x border-gray-800">
+            <!-- Mesajlar buraya eklenecek -->
+        </div>
+
+        <!-- Mesaj Gönderme Formu -->
+        <div class="bg-gray-800 p-4 rounded-b-lg border-t border-gray-700">
+            <form onsubmit="sendMessage(event)" class="flex gap-2">
+                <input type="text" id="message-input" autocomplete="off" class="flex-1 bg-gray-700 border border-gray-600 rounded p-2 focus:outline-none focus:border-indigo-500" placeholder="Mesajınızı yazın...">
+                <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 px-6 py-2 rounded font-bold transition">Gönder</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // GunDB Tanımlaması - Herkesin katılabileceği ortak sunucuları (relay) kullanıyoruz.
+        // Herhangi bir üyelik veya API key gerektirmez.
+        const gun = GUN([
+            'https://gun-manhattan.herokuapp.com/gun',
+            'https://gun-us.herokuapp.com/gun'
+        ]);
+
+        let derivedKey = null;
+        let roomHash = "";
+        let myUsername = "";
+        let roomConnection = null;
+        
+        // Gelen mesajları sıralı tutmak için
+        const seenMessages = new Set();
+        const messagesArray = [];
+
+        // Oda isminin SHA-256 hash'ini alıyoruz
+        async function hashRoomName(name) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(name.toLowerCase().trim());
+            const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        // Şifreleme Anahtarı Türetme (PBKDF2)
+        async function deriveKeyFromPassword(password) {
+            const encoder = new TextEncoder();
+            const passwordBytes = encoder.encode(password);
+            const saltBytes = encoder.encode("AnilEmre01FixedSalt"); // Sabit tuz değeri
+
+            const baseKey = await crypto.subtle.importKey(
+                "raw",
+                passwordBytes,
+                "PBKDF2",
+                false,
+                ["deriveKey"]
+            );
+
+            return crypto.subtle.deriveKey(
+                {
+                    name: "PBKDF2",
+                    salt: saltBytes,
+                    iterations: 100000,
+                    hash: "SHA-256"
+                },
+                baseKey,
+                { name: "AES-GCM", length: 256 },
+                false,
+                ["encrypt", "decrypt"]
+            );
+        }
+
+        // Metni Şifreleme (AES-GCM)
+        async function encryptText(text, key) {
+            const encoder = new TextEncoder();
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ciphertextBuffer = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: iv },
+                key,
+                encoder.encode(text)
+            );
+            const ciphertextB64 = btoa(String.fromCharCode(...new Uint8Array(ciphertextBuffer)));
+            const ivB64 = btoa(String.fromCharCode(...iv));
+            return { ciphertext: ciphertextB64, iv: ivB64 };
+        }
+
+        // Şifreli Metni Çözme
+        async function decryptText(ciphertextB64, ivB64, key) {
+            try {
+                const ciphertext = new Uint8Array(atob(ciphertextB64).split("").map(c => c.charCodeAt(0)));
+                const iv = new Uint8Array(atob(ivB64).split("").map(c => c.charCodeAt(0)));
+                const decryptedBuffer = await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: iv },
+                    key,
+                    ciphertext
+                );
+                return new TextDecoder().decode(decryptedBuffer);
+            } catch (e) {
+                return "[Şifre Çözülemedi]";
+            }
+        }
+
+        // Odaya Bağlan
+        async function joinRoom() {
+            const roomName = document.getElementById("room-input").value;
+            const password = document.getElementById("password-input").value;
+            const username = document.getElementById("username-input").value;
+
+            if (!roomName || !password || !username) {
+                alert("Lütfen tüm alanları doldurun!");
+                return;
+            }
+
+            myUsername = username.trim();
+            roomHash = await hashRoomName(roomName);
+            derivedKey = await deriveKeyFromPassword(password);
+
+            document.getElementById("active-room-title").innerText = `Oda: #${roomName}`;
+            document.getElementById("login-screen").classList.add("hidden");
+            document.getElementById("chat-screen").classList.remove("hidden");
+
+            // GunDB üzerinden odayı dinlemeye başlıyoruz
+            listenToRoom();
+        }
+
+        // Odayı Dinleme
+        function listenToRoom() {
+            roomConnection = gun.get('anil-emre-chat-' + roomHash);
+            
+            // map().on() sayesinde gelen tüm mesajları anlık olarak yakalıyoruz
+            roomConnection.map().on(async (msg, id) => {
+                if (!msg || seenMessages.has(id)) return;
+                seenMessages.add(id);
+                
+                await processAndRenderMessage(msg);
+            });
+        }
+
+        // Gelen mesajı çözüp listeye ekleme ve kronolojik sıralama
+        async function processAndRenderMessage(msg) {
+            const decryptedMessage = await decryptText(msg.ciphertext, msg.iv, derivedKey);
+            const decryptedSender = await decryptText(msg.sender, msg.iv, derivedKey);
+            const time = msg.time || Date.now();
+
+            // Eğer şifre çözülemezse veya boşsa listeye ekleme
+            if (decryptedMessage === "[Şifre Çözülemedi]") return;
+
+            messagesArray.push({ sender: decryptedSender, text: decryptedMessage, time: time });
+            
+            // Mesajları zamana göre sıralıyoruz
+            messagesArray.sort((a, b) => a.time - b.time);
+
+            // Arayüzü yeniden çiziyoruz
+            const container = document.getElementById("messages-container");
+            container.innerHTML = "";
+
+            messagesArray.forEach(m => {
+                const isMe = m.sender === myUsername;
+                const msgDiv = document.createElement("div");
+                msgDiv.className = `flex flex-col ${isMe ? 'items-end' : 'items-start'}`;
+                msgDiv.innerHTML = `
+                    <div class="max-w-xs md:max-w-md rounded-lg p-3 ${isMe ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-gray-800 text-gray-200 rounded-bl-none'}">
+                        <span class="block text-xs font-bold opacity-75 mb-1">${m.sender}</span>
+                        <p class="break-words">${m.text}</p>
+                    </div>
+                `;
+                container.appendChild(msgDiv);
+            });
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Mesaj Gönderme
+        async function sendMessage(e) {
+            e.preventDefault();
+            const input = document.getElementById("message-input");
+            const text = input.value.trim();
+            if (!text || !roomConnection) return;
+
+            input.value = "";
+
+            // Mesajı ve gönderen adını yerel olarak şifrele
+            const encryptedMessage = await encryptText(text, derivedKey);
+            const encryptedSender = await encryptText(myUsername, derivedKey);
+
+            // GunDB'ye şifreli halini gönder
+            roomConnection.set({
+                ciphertext: encryptedMessage.ciphertext,
+                iv: encryptedMessage.iv,
+                sender: encryptedSender.ciphertext,
+                time: Date.now()
+            });
+        }
+
+        // Odadan Çıkış
+        function leaveRoom() {
+            location.reload(); // Sayfayı yenileyerek bellekteki tüm anahtarları temizliyoruz
+        }
+    </script>
+</body>
+</html>
